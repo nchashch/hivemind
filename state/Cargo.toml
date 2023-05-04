@@ -8,8 +8,8 @@ edition = "2021"
 [dependencies]
 hivemind_types = { path = "../types" }
 
-nalgebra = { version = "0.32.2", features = ["serde"] }
-rust_decimal = { version = "1.29.1", features = ["maths", "serde"] }
+nalgebra = "0.32.2"
+rust_decimal = { version = "1.29.1", features = ["maths"] }
 rust_decimal_macros = "1.29.1"
 
 thiserror = "1.0.40"
