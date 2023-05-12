@@ -1,13 +1,14 @@
 use heed::types::*;
-use heed::{Database, RoTxn, RwTxn};
-use hivemind_types::{sdk_authorization_ed25519_dalek, sdk_types, sdk_types::OutPoint, *};
-use nalgebra::{DVector, Vector2};
+use heed::{Database, RoTxn};
+use hivemind_types::{sdk_authorization_ed25519_dalek, sdk_types};
+use hivemind_types::{sdk_types::OutPoint, *};
+use nalgebra::DVector;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 use sdk_types::GetValue as _;
 use std::collections::HashMap;
 
-struct State {
+pub struct State {
     pub utxos: Database<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
     pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<u64>>>,
 }
@@ -30,6 +31,7 @@ impl State {
                 .utxos
                 .get(txn, input)?
                 .ok_or(Error::NoUtxo { outpoint: *input })?;
+            inputs.push(utxo);
         }
         Ok(FilledTransaction {
             inputs,
@@ -42,7 +44,8 @@ impl State {
         txn: &RoTxn,
         transaction: &FilledTransaction,
     ) -> Result<(HashMap<OutPoint, DVector<Decimal>>, u64, u64), Error> {
-        // TODO: Use more efficient hash maps (there is no need to hash OutPoints).
+        // TODO: Use more efficient hash maps (there is no need to hash
+        // OutPoints).
         let mut markets: HashMap<OutPoint, (u64, u32)> = HashMap::new();
         let mut market_to_delta: HashMap<OutPoint, DVector<Decimal>> = HashMap::new();
         let mut input_value: u64 = 0;
@@ -54,7 +57,7 @@ impl State {
                     share,
                     value,
                 }) => {
-                    let (_, size) = markets.entry(market).or_insert({
+                    let (_b, size) = markets.entry(market).or_insert({
                         let market = self
                             .utxos
                             .get(txn, &market)?
@@ -83,16 +86,16 @@ impl State {
                     share,
                     value,
                 }) => {
-                    let (_, size) = markets.entry(market).or_insert({
-                        let market = self
+                    let (_b, size) = markets.entry(market).or_insert({
+                        let market_output = self
                             .utxos
                             .get(txn, &market)?
                             .ok_or(Error::NoUtxo { outpoint: market })?;
-                        match market.content {
+                        match market_output.content {
                             sdk_types::Content::Custom(HivemindContent::Market { b, size }) => {
                                 (b, size)
                             }
-                            _ => unreachable!(),
+                            _ => return Err(Error::InvalidMarketOutPoint { outpoint: market }),
                         }
                     });
                     let delta = market_to_delta
@@ -110,8 +113,8 @@ impl State {
         &self,
         txn: &RoTxn,
         market_to_delta: &HashMap<OutPoint, DVector<Decimal>>,
-    ) -> Result<u64, Error> {
-        let mut total_cost: u64 = 0;
+    ) -> Result<Decimal, Error> {
+        let mut total_cost: Decimal = dec!(0);
         for (market, delta) in market_to_delta {
             let state: Vec<Decimal> = self
                 .markets
@@ -121,19 +124,19 @@ impl State {
                 .map(|n| Decimal::from(*n))
                 .collect();
             let state = DVector::from(state);
-            let (b, size) = {
+            let (b, _size) = {
                 let market = self
                     .utxos
-                    .get(txn, &market)?
+                    .get(txn, market)?
                     .ok_or(Error::NoUtxo { outpoint: *market })?;
                 match market.content {
                     sdk_types::Content::Custom(HivemindContent::Market { b, size }) => (b, size),
                     _ => unreachable!(),
                 }
             };
-            let cost = lmsr_cost(Decimal::from(b), &(state.clone() + delta))
-                - lmsr_cost(Decimal::from(b), &state);
-            total_cost += cost.to_u64().ok_or(Error::U64Overflow { decimal: cost })?;
+            let cost = Self::lmsr_cost(Decimal::from(b), &(state.clone() + delta))
+                - Self::lmsr_cost(Decimal::from(b), &state);
+            total_cost += cost;
         }
         Ok(total_cost)
     }
@@ -146,20 +149,17 @@ impl State {
         let (market_to_delta, input_value, output_value) =
             self.get_deltas_and_values(txn, transaction)?;
         let cost = self.get_cost(txn, &market_to_delta)?;
-        if cost + output_value > input_value {
-            return Err(Error::NotEnoughValueIn {
-                cost,
-                output_value,
-                input_value,
-            });
+        // NOTE: Cost is *negative* when you are selling shares.
+        if cost + Decimal::from(output_value) > Decimal::from(input_value) {
+            return Err(Error::NotEnoughValueIn);
         }
         Ok(())
     }
-}
 
-fn lmsr_cost(b: Decimal, state: &DVector<Decimal>) -> Decimal {
-    let max_money = dec!(21_000_000_00_000_000);
-    state.map(|q| (q / (b * max_money)).exp()).sum().ln() * b * max_money
+    fn lmsr_cost(b: Decimal, state: &DVector<Decimal>) -> Decimal {
+        let max_money = dec!(21_000_000_00_000_000);
+        state.map(|q| (q / (b * max_money)).exp()).sum().ln() * b * max_money
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -172,12 +172,10 @@ pub enum Error {
     Heed(#[from] heed::Error),
     #[error("utxo {outpoint} doesn't exist")]
     NoUtxo { outpoint: OutPoint },
+    #[error("outpoint {outpoint} doesn't refer to a valid market")]
+    InvalidMarketOutPoint { outpoint: OutPoint },
     #[error("number {decimal} doesn't fit in a u64")]
     U64Overflow { decimal: Decimal },
-    #[error("value in is not enough to cover amm trade cost and value out: {cost} + {output_value} > {input_value}")]
-    NotEnoughValueIn {
-        cost: u64,
-        input_value: u64,
-        output_value: u64,
-    },
+    #[error("value in is not enough to cover amm trade cost and value out")]
+    NotEnoughValueIn,
 }
