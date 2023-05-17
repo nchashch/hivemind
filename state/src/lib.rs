@@ -1,4 +1,4 @@
-use heed::types::*;
+use heed::{types::*, RwTxn};
 use heed::{Database, RoTxn};
 use hivemind_types::{sdk_authorization_ed25519_dalek, sdk_types};
 use hivemind_types::{sdk_types::OutPoint, *};
@@ -6,14 +6,16 @@ use nalgebra::DVector;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 use sdk_types::GetValue as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct State {
     pub utxos: Database<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
-    pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<u64>>>,
+    pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<Decimal>>>,
 }
 
 impl State {
+    pub const NUM_DBS: u32 = 2;
+
     pub fn new(env: &heed::Env) -> Result<Self, Error> {
         let utxos = env.create_database(Some("utxos"))?;
         let markets = env.create_database(Some("markets"))?;
@@ -80,6 +82,14 @@ impl State {
         let mut output_value: u64 = 0;
         for output in &transaction.outputs {
             output_value += output.get_value();
+            // It costs `b * ln(size)` to create a new market with `size` possible outcomes.
+            //
+            // This is not covered by get_value() because once created spent Market UTXOs don't
+            // count towards input_value.
+            //
+            // But when a market is resolved, its value would = to the market authors share in
+            // fees.
+            output_value += Self::get_market_funding_cost(output)?;
             match output.content {
                 sdk_types::Content::Custom(HivemindContent::Position {
                     market,
@@ -98,6 +108,7 @@ impl State {
                             _ => return Err(Error::InvalidMarketOutPoint { outpoint: market }),
                         }
                     });
+
                     let delta = market_to_delta
                         .entry(market)
                         .or_insert(DVector::from_element(*size as usize, dec!(0)));
@@ -121,7 +132,7 @@ impl State {
                 .get(txn, market)?
                 .ok_or(Error::NoUtxo { outpoint: *market })?
                 .iter()
-                .map(|n| Decimal::from(*n))
+                .copied()
                 .collect();
             let state = DVector::from(state);
             let (b, _size) = {
@@ -141,11 +152,12 @@ impl State {
         Ok(total_cost)
     }
 
+    // TODO: Check that input_value in is enough to cover market creation.
     pub fn validate_transaction(
         &self,
         txn: &RoTxn,
         transaction: &FilledTransaction,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let (market_to_delta, input_value, output_value) =
             self.get_deltas_and_values(txn, transaction)?;
         let cost = self.get_cost(txn, &market_to_delta)?;
@@ -153,12 +165,89 @@ impl State {
         if cost + Decimal::from(output_value) > Decimal::from(input_value) {
             return Err(Error::NotEnoughValueIn);
         }
+        let fee =
+            input_value - cost.to_u64().ok_or(Error::U64Overflow { decimal: cost })? + output_value;
+        Ok(fee)
+    }
+
+    pub fn validate_body(&self, txn: &RoTxn, body: Body) -> Result<(), Error> {
+        let mut fee_value = 0;
+        {
+            let mut spent = HashSet::new();
+            for transaction in &body.transactions {
+                for input in &transaction.inputs {
+                    if spent.contains(input) {
+                        return Err(Error::UtxoDoubleSpent { outpoint: *input });
+                    }
+                    spent.insert(input);
+                    let transaction = self.fill_transaction(txn, transaction)?;
+                    fee_value += self.validate_transaction(txn, &transaction)?;
+                }
+            }
+        }
+        let mut coinbase_value = 0;
+        for output in &body.coinbase {
+            coinbase_value += output.get_value();
+        }
+
+        if coinbase_value > fee_value {
+            return Err(Error::NotEnoughFeeValue);
+        }
+        Ok(())
+    }
+
+    pub fn connect_body(&self, txn: &mut RwTxn, body: &Body) -> Result<(), Error> {
+        let mut body_market_to_delta = HashMap::new();
+        for transaction in &body.transactions {
+            for input in &transaction.inputs {
+                self.utxos.delete(txn, input)?;
+            }
+            let txid = transaction.txid();
+            for (vout, output) in transaction.outputs.iter().enumerate() {
+                let outpoint = OutPoint::Regular {
+                    txid,
+                    vout: vout as u32,
+                };
+                self.utxos.put(txn, &outpoint, output)?;
+            }
+            let transaction = self.fill_transaction(txn, transaction)?;
+            let (market_to_delta, _, _) = self.get_deltas_and_values(txn, &transaction)?;
+            for (market, delta) in &market_to_delta {
+                let body_delta = body_market_to_delta
+                    .entry(*market)
+                    .or_insert(DVector::from_element(delta.len(), dec!(0)));
+                *body_delta += delta;
+            }
+        }
+        for (market, delta) in &body_market_to_delta {
+            let state = self
+                .markets
+                .get(txn, market)?
+                .ok_or(Error::NoUtxo { outpoint: *market })?;
+            let state = DVector::from(state);
+            let new_state = state + delta;
+            let new_state: Vec<Decimal> = new_state.iter().copied().collect();
+            self.markets.put(txn, market, &new_state)?;
+        }
         Ok(())
     }
 
     fn lmsr_cost(b: Decimal, state: &DVector<Decimal>) -> Decimal {
+        // We multiply b by max_money to avoid exp overflow.
         let max_money = dec!(21_000_000_00_000_000);
         state.map(|q| (q / (b * max_money)).exp()).sum().ln() * b * max_money
+    }
+
+    fn get_market_funding_cost(output: &Output) -> Result<u64, Error> {
+        match output.content {
+            sdk_types::Content::Custom(HivemindContent::Market { b, size }) => {
+                let b = Decimal::from(b);
+                let size = Decimal::from(size);
+                let cost = b * size.ln();
+                cost.to_u64().ok_or(Error::U64Overflow { decimal: cost })
+            }
+            _ => Ok(0),
+        }
     }
 }
 
@@ -178,4 +267,8 @@ pub enum Error {
     U64Overflow { decimal: Decimal },
     #[error("value in is not enough to cover amm trade cost and value out")]
     NotEnoughValueIn,
+    #[error("fee value is not enough to cover coinbase value out")]
+    NotEnoughFeeValue,
+    #[error("utxo {outpoint} was spent more than once in this block")]
+    UtxoDoubleSpent { outpoint: OutPoint },
 }
