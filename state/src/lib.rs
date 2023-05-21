@@ -16,6 +16,9 @@ pub struct State {
     pub utxos: Database<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
     pub vectors: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<Decimal>>>,
     pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Market>>,
+    // There is some aparent redundancy, position outpoints are stored twice: once as keys in utxos
+    // db and once as values in market_to_positions db.
+    pub market_to_positions: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<OutPoint>>>,
 }
 
 impl State {
@@ -25,10 +28,12 @@ impl State {
         let utxos = env.create_database(Some("utxos"))?;
         let vectors = env.create_database(Some("vectors"))?;
         let markets = env.create_database(Some("markets"))?;
+        let market_to_positions = env.create_database(Some("market_to_positions"))?;
         Ok(State {
             utxos,
             vectors,
             markets,
+            market_to_positions,
         })
     }
 
@@ -261,9 +266,11 @@ impl State {
 
     pub fn connect_body(&self, txn: &mut RwTxn, body: &Body) -> Result<(), Error> {
         let mut body_market_to_delta = HashMap::new();
+        let mut decision_to_outcome = HashMap::new();
         for transaction in &body.transactions {
             for input in &transaction.inputs {
                 self.utxos.delete(txn, input)?;
+                panic!("this is incorrect! Delete data from other dbs as well.");
             }
             let txid = transaction.txid();
             for (vout, output) in transaction.outputs.iter().enumerate() {
@@ -273,13 +280,20 @@ impl State {
                 };
                 self.utxos.put(txn, &outpoint, output)?;
 
-                let mut decision_to_outcome = HashMap::new();
                 match &output.content {
+                    sdk_types::Content::Custom(HivemindContent::Position { market, .. }) => {
+                        let mut positions = self
+                            .market_to_positions
+                            .get(txn, market)?
+                            .ok_or(Error::NoUtxo { outpoint: *market })?;
+                        positions.push(outpoint);
+                        self.market_to_positions.put(txn, market, &positions)?;
+                    }
                     sdk_types::Content::Custom(HivemindContent::Resolution {
                         decision,
                         outcome,
                     }) => {
-                        decision_to_outcome.insert(decision, outcome);
+                        decision_to_outcome.insert(decision, *outcome);
                     }
                     sdk_types::Content::Custom(HivemindContent::Market { b, decisions }) => {
                         let mut shape = vec![];
@@ -335,6 +349,60 @@ impl State {
         // After all market decisions are resolved the market itself is resolved.
         // All Position outputs with share == outcome turn into Value outputs.
         // All other Position outputs are removed.
+
+        let mut updated_markets = vec![];
+        let mut resolved_markets = vec![];
+        for item in self.markets.iter(txn)? {
+            let (outpoint, market) = item?;
+            let mut outcomes = vec![];
+            for decision in &market.decisions {
+                outcomes.push(decision_to_outcome.get(decision).copied());
+            }
+            if outcomes.iter().all(Option::is_some) {
+                let outcomes: Vec<u32> = outcomes.iter().copied().map(Option::unwrap).collect();
+                resolved_markets.push((outpoint, outcomes));
+            }
+            updated_markets.push((outpoint, Market { outcomes, ..market }));
+        }
+        for (outpoint, outcomes) in &resolved_markets {
+            let resolved_positions =
+                self.market_to_positions
+                    .get(txn, &outpoint)?
+                    .ok_or(Error::NoUtxo {
+                        outpoint: *outpoint,
+                    })?;
+            for position_outpoint in &resolved_positions {
+                let position = self
+                    .utxos
+                    .get(txn, position_outpoint)?
+                    .ok_or(Error::NoUtxo {
+                        outpoint: *outpoint,
+                    })?;
+                match &position.content {
+                    sdk_types::Content::Custom(HivemindContent::Position {
+                        share, value, ..
+                    }) => {
+                        if share == outcomes {
+                            let content = sdk_types::Content::<HivemindContent>::Value(*value);
+                            self.utxos.put(
+                                txn,
+                                position_outpoint,
+                                &Output {
+                                    content,
+                                    ..position.clone()
+                                },
+                            )?;
+                        } else {
+                            self.utxos.delete(txn, position_outpoint)?;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        for (outpoint, market) in &updated_markets {
+            self.markets.put(txn, outpoint, market)?;
+        }
         Ok(())
     }
 

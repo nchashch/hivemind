@@ -55,7 +55,7 @@ pub struct FilledTransaction {
     pub transaction: Transaction,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Market {
     pub b: u64,
     pub shape: Vec<u32>,
