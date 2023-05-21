@@ -10,16 +10,22 @@ use std::collections::{HashMap, HashSet};
 
 pub struct State {
     pub utxos: Database<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
-    pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<Decimal>>>,
+    pub vectors: Database<SerdeBincode<OutPoint>, SerdeBincode<Vec<Decimal>>>,
+    pub markets: Database<SerdeBincode<OutPoint>, SerdeBincode<Market>>,
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 2;
+    pub const NUM_DBS: u32 = 3;
 
     pub fn new(env: &heed::Env) -> Result<Self, Error> {
         let utxos = env.create_database(Some("utxos"))?;
+        let vectors = env.create_database(Some("vectors"))?;
         let markets = env.create_database(Some("markets"))?;
-        Ok(State { utxos, markets })
+        Ok(State {
+            utxos,
+            vectors,
+            markets,
+        })
     }
 
     pub fn fill_transaction(
@@ -48,33 +54,22 @@ impl State {
     ) -> Result<(HashMap<OutPoint, DVector<Decimal>>, u64, u64), Error> {
         // TODO: Use more efficient hash maps (there is no need to hash
         // OutPoints).
-        let mut markets: HashMap<OutPoint, (u64, u32)> = HashMap::new();
         let mut market_to_delta: HashMap<OutPoint, DVector<Decimal>> = HashMap::new();
         let mut input_value: u64 = 0;
         for input in &transaction.inputs {
             input_value += input.get_value();
-            match input.content {
+            match &input.content {
                 sdk_types::Content::Custom(HivemindContent::Position {
                     market,
                     share,
                     value,
                 }) => {
-                    let (_b, size) = markets.entry(market).or_insert({
-                        let market = self
-                            .utxos
-                            .get(txn, &market)?
-                            .ok_or(Error::NoUtxo { outpoint: market })?;
-                        match market.content {
-                            sdk_types::Content::Custom(HivemindContent::Market { b, size }) => {
-                                (b, size)
-                            }
-                            _ => unreachable!(),
-                        }
-                    });
+                    let size = self.get_size(txn, &market)?;
                     let delta = market_to_delta
-                        .entry(market)
-                        .or_insert(DVector::from_element(*size as usize, dec!(0)));
-                    delta[share as usize] -= Decimal::from(value);
+                        .entry(*market)
+                        .or_insert(DVector::from_element(size as usize, dec!(0)));
+                    let flat_index = self.share_to_flat_index(txn, &market, &share)?;
+                    delta[flat_index as usize] -= Decimal::from(*value);
                 }
                 _ => {}
             };
@@ -89,35 +84,52 @@ impl State {
             //
             // But when a market is resolved, its value would = to the market authors share in
             // fees.
-            output_value += Self::get_market_funding_cost(output)?;
-            match output.content {
+            output_value += self.get_market_funding_cost(txn, output)?;
+            match &output.content {
                 sdk_types::Content::Custom(HivemindContent::Position {
                     market,
                     share,
                     value,
                 }) => {
-                    let (_b, size) = markets.entry(market).or_insert({
-                        let market_output = self
-                            .utxos
-                            .get(txn, &market)?
-                            .ok_or(Error::NoUtxo { outpoint: market })?;
-                        match market_output.content {
-                            sdk_types::Content::Custom(HivemindContent::Market { b, size }) => {
-                                (b, size)
-                            }
-                            _ => return Err(Error::InvalidMarketOutPoint { outpoint: market }),
-                        }
-                    });
-
+                    let size = self.get_size(txn, &market)?;
                     let delta = market_to_delta
-                        .entry(market)
-                        .or_insert(DVector::from_element(*size as usize, dec!(0)));
-                    delta[share as usize] += Decimal::from(value);
+                        .entry(*market)
+                        .or_insert(DVector::from_element(size as usize, dec!(0)));
+                    let flat_index = self.share_to_flat_index(txn, &market, &share)?;
+                    delta[flat_index as usize] += Decimal::from(*value);
                 }
                 _ => {}
             };
         }
         Ok((market_to_delta, input_value, output_value))
+    }
+
+    fn share_to_flat_index(
+        &self,
+        txn: &RoTxn,
+        market: &OutPoint,
+        share: &[u32],
+    ) -> Result<u32, Error> {
+        let market = self
+            .markets
+            .get(txn, market)?
+            .ok_or(Error::NoUtxo { outpoint: *market })?;
+
+        let mut step: u32 = market.shape.iter().product();
+        let mut flat_index = 0;
+        for (index, size) in share.iter().zip(market.shape.iter()) {
+            step /= size;
+            flat_index += index * step;
+        }
+        Ok(flat_index)
+    }
+
+    fn get_size(&self, txn: &RoTxn, market: &OutPoint) -> Result<u32, Error> {
+        let market = self
+            .markets
+            .get(txn, &market)?
+            .ok_or(Error::NoUtxo { outpoint: *market })?;
+        Ok(market.shape.iter().product())
     }
 
     fn get_cost(
@@ -128,20 +140,20 @@ impl State {
         let mut total_cost: Decimal = dec!(0);
         for (market, delta) in market_to_delta {
             let state: Vec<Decimal> = self
-                .markets
+                .vectors
                 .get(txn, market)?
                 .ok_or(Error::NoUtxo { outpoint: *market })?
                 .iter()
                 .copied()
                 .collect();
             let state = DVector::from(state);
-            let (b, _size) = {
+            let b = {
                 let market = self
                     .utxos
                     .get(txn, market)?
                     .ok_or(Error::NoUtxo { outpoint: *market })?;
                 match market.content {
-                    sdk_types::Content::Custom(HivemindContent::Market { b, size }) => (b, size),
+                    sdk_types::Content::Custom(HivemindContent::Market { b, .. }) => b,
                     _ => unreachable!(),
                 }
             };
@@ -221,13 +233,13 @@ impl State {
         }
         for (market, delta) in &body_market_to_delta {
             let state = self
-                .markets
+                .vectors
                 .get(txn, market)?
                 .ok_or(Error::NoUtxo { outpoint: *market })?;
             let state = DVector::from(state);
             let new_state = state + delta;
             let new_state: Vec<Decimal> = new_state.iter().copied().collect();
-            self.markets.put(txn, market, &new_state)?;
+            self.vectors.put(txn, market, &new_state)?;
         }
         Ok(())
     }
@@ -238,10 +250,24 @@ impl State {
         state.map(|q| (q / (b * max_money)).exp()).sum().ln() * b * max_money
     }
 
-    fn get_market_funding_cost(output: &Output) -> Result<u64, Error> {
-        match output.content {
-            sdk_types::Content::Custom(HivemindContent::Market { b, size }) => {
-                let b = Decimal::from(b);
+    fn get_market_funding_cost(&self, txn: &RoTxn, output: &Output) -> Result<u64, Error> {
+        match &output.content {
+            sdk_types::Content::Custom(HivemindContent::Market { b, decisions }) => {
+                let mut size: u32 = 1;
+                for outpoint in decisions {
+                    let decision = self.utxos.get(txn, outpoint)?.ok_or(Error::NoUtxo {
+                        outpoint: *outpoint,
+                    })?;
+                    size *= match decision.content {
+                        sdk_types::Content::Custom(HivemindContent::Decision { size, .. }) => {
+                            Ok(size)
+                        }
+                        _ => Err(Error::InvalidOutPoint {
+                            outpoint: *outpoint,
+                        }),
+                    }?;
+                }
+                let b = Decimal::from(*b);
                 let size = Decimal::from(size);
                 let cost = b * size.ln();
                 cost.to_u64().ok_or(Error::U64Overflow { decimal: cost })
@@ -262,7 +288,7 @@ pub enum Error {
     #[error("utxo {outpoint} doesn't exist")]
     NoUtxo { outpoint: OutPoint },
     #[error("outpoint {outpoint} doesn't refer to a valid market")]
-    InvalidMarketOutPoint { outpoint: OutPoint },
+    InvalidOutPoint { outpoint: OutPoint },
     #[error("number {decimal} doesn't fit in a u64")]
     U64Overflow { decimal: Decimal },
     #[error("value in is not enough to cover amm trade cost and value out")]
