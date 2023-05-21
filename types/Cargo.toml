@@ -9,3 +9,6 @@ edition = "2021"
 sdk_types = { git = "https://github.com/nchashch/sdk_types" }
 sdk_authorization_ed25519_dalek = { git = "https://github.com/nchashch/sdk_authorization_ed25519_dalek" }
 serde = { version = "1.0.160", features = ["derive"] }
+rust_decimal = { version = "1.29.1", features = ["maths"] }
+nalgebra = "0.32.2"
+rust_decimal_macros = "1.29.1"

@@ -7,10 +7,6 @@ edition = "2021"
 
 [dependencies]
 hivemind_types = { path = "../types" }
-
-nalgebra = "0.32.2"
-rust_decimal = { version = "1.29.1", features = ["maths"] }
-rust_decimal_macros = "1.29.1"
-
 thiserror = "1.0.40"
 heed = { git = "https://github.com/meilisearch/heed", tag = "v0.12.4" }
+rust_decimal = "1.29.1"

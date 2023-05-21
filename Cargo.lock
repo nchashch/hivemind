@@ -434,9 +434,7 @@ version = "0.1.0"
 dependencies = [
  "heed",
  "hivemind_types",
- "nalgebra",
  "rust_decimal",
- "rust_decimal_macros",
  "thiserror",
 ]
 
@@ -444,6 +442,9 @@ dependencies = [
 name = "hivemind_types"
 version = "0.1.0"
 dependencies = [
+ "nalgebra",
+ "rust_decimal",
+ "rust_decimal_macros",
  "sdk_authorization_ed25519_dalek",
  "sdk_types",
  "serde",

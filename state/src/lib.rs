@@ -1,11 +1,15 @@
-use heed::{types::*, RwTxn};
-use heed::{Database, RoTxn};
-use hivemind_types::{sdk_authorization_ed25519_dalek, sdk_types};
-use hivemind_types::{sdk_types::OutPoint, *};
+use hivemind_types::{
+    nalgebra, rust_decimal, rust_decimal_macros, sdk_authorization_ed25519_dalek, sdk_types,
+};
+
 use nalgebra::DVector;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 use sdk_types::GetValue as _;
+
+use heed::{types::*, RwTxn};
+use heed::{Database, RoTxn};
+use hivemind_types::{sdk_types::OutPoint, *};
 use std::collections::{HashMap, HashSet};
 
 pub struct State {
@@ -15,7 +19,7 @@ pub struct State {
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 3;
+    pub const NUM_DBS: u32 = 4;
 
     pub fn new(env: &heed::Env) -> Result<Self, Error> {
         let utxos = env.create_database(Some("utxos"))?;
@@ -33,17 +37,17 @@ impl State {
         txn: &RoTxn,
         transaction: &Transaction,
     ) -> Result<FilledTransaction, Error> {
-        let mut inputs = vec![];
+        let mut spent_utxos = vec![];
         for input in &transaction.inputs {
             let utxo = self
                 .utxos
                 .get(txn, input)?
                 .ok_or(Error::NoUtxo { outpoint: *input })?;
-            inputs.push(utxo);
+            spent_utxos.push(utxo);
         }
         Ok(FilledTransaction {
-            inputs,
-            outputs: transaction.outputs.clone(),
+            spent_utxos,
+            transaction: transaction.clone(),
         })
     }
 
@@ -56,9 +60,9 @@ impl State {
         // OutPoints).
         let mut market_to_delta: HashMap<OutPoint, DVector<Decimal>> = HashMap::new();
         let mut input_value: u64 = 0;
-        for input in &transaction.inputs {
-            input_value += input.get_value();
-            match &input.content {
+        for spent_utxo in &transaction.spent_utxos {
+            input_value += spent_utxo.get_value();
+            match &spent_utxo.content {
                 sdk_types::Content::Custom(HivemindContent::Position {
                     market,
                     share,
@@ -75,7 +79,7 @@ impl State {
             };
         }
         let mut output_value: u64 = 0;
-        for output in &transaction.outputs {
+        for output in &transaction.transaction.outputs {
             output_value += output.get_value();
             // It costs `b * ln(size)` to create a new market with `size` possible outcomes.
             //
@@ -157,8 +161,8 @@ impl State {
                     _ => unreachable!(),
                 }
             };
-            let cost = Self::lmsr_cost(Decimal::from(b), &(state.clone() + delta))
-                - Self::lmsr_cost(Decimal::from(b), &state);
+            let cost = lmsr_cost(Decimal::from(b), &(state.clone() + delta))
+                - lmsr_cost(Decimal::from(b), &state);
             total_cost += cost;
         }
         Ok(total_cost)
@@ -169,7 +173,54 @@ impl State {
         &self,
         txn: &RoTxn,
         transaction: &FilledTransaction,
+        height: u32,
     ) -> Result<u64, Error> {
+        let mut resolved_decisions = HashSet::new();
+        let mut spent_decisions = vec![];
+        for (outpoint, spent_utxo) in transaction
+            .transaction
+            .inputs
+            .iter()
+            .zip(transaction.spent_utxos.iter())
+        {
+            match &spent_utxo.content {
+                sdk_types::Content::Custom(HivemindContent::Decision {
+                    resolvable_height, ..
+                }) => {
+                    if *resolvable_height < height {
+                        return Err(Error::DecisionSpentEarly);
+                    }
+                    spent_decisions.push(outpoint);
+                }
+                sdk_types::Content::Custom(HivemindContent::Resolution { decision, .. }) => {
+                    resolved_decisions.insert(decision);
+                }
+                sdk_types::Content::Custom(HivemindContent::Market { decisions, .. }) => {
+                    for decision in decisions {
+                        let decision = self.utxos.get(txn, decision)?.ok_or(Error::NoUtxo {
+                            outpoint: *decision,
+                        })?;
+                        match decision.content {
+                            sdk_types::Content::Custom(HivemindContent::Decision {
+                                resolvable_height,
+                                ..
+                            }) => {
+                                if height > resolvable_height {
+                                    return Err(Error::MarketUsingResolvableDecision);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for spent_decision in &spent_decisions {
+            if !resolved_decisions.contains(spent_decision) {
+                return Err(Error::DecisionSpentWithoutResolution);
+            }
+        }
         let (market_to_delta, input_value, output_value) =
             self.get_deltas_and_values(txn, transaction)?;
         let cost = self.get_cost(txn, &market_to_delta)?;
@@ -193,7 +244,7 @@ impl State {
                     }
                     spent.insert(input);
                     let transaction = self.fill_transaction(txn, transaction)?;
-                    fee_value += self.validate_transaction(txn, &transaction)?;
+                    fee_value += self.validate_transaction(txn, &transaction, 0)?;
                 }
             }
         }
@@ -221,6 +272,45 @@ impl State {
                     vout: vout as u32,
                 };
                 self.utxos.put(txn, &outpoint, output)?;
+
+                let mut decision_to_outcome = HashMap::new();
+                match &output.content {
+                    sdk_types::Content::Custom(HivemindContent::Resolution {
+                        decision,
+                        outcome,
+                    }) => {
+                        decision_to_outcome.insert(decision, outcome);
+                    }
+                    sdk_types::Content::Custom(HivemindContent::Market { b, decisions }) => {
+                        let mut shape = vec![];
+                        for decision in decisions {
+                            let decision = self.utxos.get(txn, decision)?.ok_or(Error::NoUtxo {
+                                outpoint: *decision,
+                            })?;
+                            let size = match decision.content {
+                                sdk_types::Content::Custom(HivemindContent::Decision {
+                                    size,
+                                    ..
+                                }) => size,
+                                _ => unreachable!(),
+                            };
+                            shape.push(size);
+                        }
+                        let outcomes = std::iter::repeat(None).take(shape.len()).collect();
+
+                        self.markets.put(
+                            txn,
+                            &outpoint,
+                            &Market {
+                                b: *b,
+                                decisions: decisions.clone(),
+                                shape,
+                                outcomes,
+                            },
+                        )?;
+                    }
+                    _ => {}
+                }
             }
             let transaction = self.fill_transaction(txn, transaction)?;
             let (market_to_delta, _, _) = self.get_deltas_and_values(txn, &transaction)?;
@@ -241,13 +331,11 @@ impl State {
             let new_state: Vec<Decimal> = new_state.iter().copied().collect();
             self.vectors.put(txn, market, &new_state)?;
         }
-        Ok(())
-    }
 
-    fn lmsr_cost(b: Decimal, state: &DVector<Decimal>) -> Decimal {
-        // We multiply b by max_money to avoid exp overflow.
-        let max_money = dec!(21_000_000_00_000_000);
-        state.map(|q| (q / (b * max_money)).exp()).sum().ln() * b * max_money
+        // After all market decisions are resolved the market itself is resolved.
+        // All Position outputs with share == outcome turn into Value outputs.
+        // All other Position outputs are removed.
+        Ok(())
     }
 
     fn get_market_funding_cost(&self, txn: &RoTxn, output: &Output) -> Result<u64, Error> {
@@ -297,4 +385,10 @@ pub enum Error {
     NotEnoughFeeValue,
     #[error("utxo {outpoint} was spent more than once in this block")]
     UtxoDoubleSpent { outpoint: OutPoint },
+    #[error("decision output is spent before its resolvable height was reached")]
+    DecisionSpentEarly,
+    #[error("decision output is spent without a resolution output being created")]
+    DecisionSpentWithoutResolution,
+    #[error("can't create market using a decision that is already resolvable at this height")]
+    MarketUsingResolvableDecision,
 }
